@@ -580,6 +580,234 @@ app.post('/webhooks/stripe/:appId', async (req, res) => {
 });
 
 
+
+// ============================================
+// POST /webhooks/polar/:appId
+// Auto top-up credits on Polar order.paid
+// Expects metadata: { tally_user_id, tally_credits (optional) }
+// ============================================
+app.post('/webhooks/polar/:appId', express.json(), async (req, res) => {
+  const { appId } = req.params;
+  const signature = req.headers['webhook-signature'];
+  const webhookId = req.headers['webhook-id'];
+  const webhookTimestamp = req.headers['webhook-timestamp'];
+
+  // Verify the app exists and get credit rate
+  const { data: appData, error: appError } = await supabase
+    .from('apps')
+    .select('id, credit_rate')
+    .eq('id', appId)
+    .single();
+
+  if (appError || !appData) {
+    return res.status(404).json({ error: 'App not found' });
+  }
+
+  // Verify Polar webhook signature (Standard Webhooks spec)
+  const polarWebhookSecret = process.env.POLAR_WEBHOOK_SECRET;
+  if (polarWebhookSecret && signature) {
+    try {
+      const { createHmac } = await import('crypto');
+      const toSign = `${webhookId}.${webhookTimestamp}.${JSON.stringify(req.body)}`;
+      const expected = createHmac('sha256', polarWebhookSecret)
+        .update(toSign)
+        .digest('base64');
+      const sigParts = signature.split(' ');
+      const valid = sigParts.some(s => s.split(',')[1] === expected);
+      if (!valid) return res.status(401).json({ error: 'Invalid signature' });
+    } catch (err) {
+      console.error('Polar signature error:', err);
+    }
+  }
+
+  const event = req.body;
+
+  // Only process order.paid — most reliable fulfillment event
+  if (event.type !== 'order.paid') {
+    return res.status(200).json({ received: true, skipped: `Event ${event.type} not handled` });
+  }
+
+  const order = event.data;
+  const metadata = order.metadata || {};
+  const tallyUserId = metadata.tally_user_id;
+  const tallyCredits = metadata.tally_credits;
+
+  if (!tallyUserId) {
+    return res.status(200).json({ received: true, skipped: 'No tally_user_id in metadata' });
+  }
+
+  const idempotencyKey = `polar_${order.id}`;
+  const cached = await checkIdempotency(idempotencyKey, appId);
+  if (cached) return res.status(200).json({ received: true, idempotent: true });
+
+  try {
+    let creditsToAdd;
+
+    if (tallyCredits) {
+      creditsToAdd = Number(tallyCredits);
+    } else if (appData?.credit_rate) {
+      // Polar amounts are in cents
+      const amountInMajorUnit = (order.amount || 0) / 100;
+      creditsToAdd = Math.floor(amountInMajorUnit * Number(appData.credit_rate));
+    } else {
+      return res.status(200).json({ received: true, skipped: 'No tally_credits and no credit_rate configured' });
+    }
+
+    const appUserId = await getOrCreateUser(appId, tallyUserId);
+
+    const { data: balance } = await supabase
+      .from('balances')
+      .select('balance')
+      .eq('app_user_id', appUserId)
+      .single();
+
+    const balanceAfter = Number(balance.balance) + creditsToAdd;
+
+    await supabase
+      .from('balances')
+      .update({ balance: balanceAfter, updated_at: new Date().toISOString() })
+      .eq('app_user_id', appUserId);
+
+    const { data: ledgerEntry } = await supabase
+      .from('ledger')
+      .insert({
+        app_user_id: appUserId,
+        event_type: 'add',
+        amount: creditsToAdd,
+        balance_after: balanceAfter,
+        idempotency_key: idempotencyKey,
+        reference_id: order.id,
+        description: `Polar order ${order.id}`,
+        metadata: { polar_amount: order.amount, currency: order.currency },
+      })
+      .select('id')
+      .single();
+
+    const result = { success: true, ledger_id: ledgerEntry.id, credits_added: creditsToAdd };
+    await saveIdempotency(idempotencyKey, appId, result);
+
+    return res.status(200).json({ received: true, ...result });
+  } catch (err) {
+    console.error('Polar webhook error:', err);
+    return res.status(500).json({ error: 'Processing failed' });
+  }
+});
+
+// ============================================
+// POST /webhooks/lemonsqueezy/:appId
+// Auto top-up credits on Lemon Squeezy order_created
+// Expects custom_data: { tally_user_id, tally_credits (optional) }
+// ============================================
+app.post('/webhooks/lemonsqueezy/:appId', express.raw({ type: 'application/json' }), async (req, res) => {
+  const { appId } = req.params;
+  const signature = req.headers['x-signature'];
+
+  // Verify the app exists
+  const { data: appData, error: appError } = await supabase
+    .from('apps')
+    .select('id, credit_rate')
+    .eq('id', appId)
+    .single();
+
+  if (appError || !appData) {
+    return res.status(404).json({ error: 'App not found' });
+  }
+
+  // Verify Lemon Squeezy HMAC signature
+  const lsSecret = process.env.LEMONSQUEEZY_WEBHOOK_SECRET;
+  if (lsSecret && signature) {
+    try {
+      const { createHmac, timingSafeEqual } = await import('crypto');
+      const expected = createHmac('sha256', lsSecret)
+        .update(req.body)
+        .digest('hex');
+      if (!timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
+        return res.status(401).json({ error: 'Invalid signature' });
+      }
+    } catch (err) {
+      console.error('LS signature error:', err);
+    }
+  }
+
+  const payload = JSON.parse(req.body.toString());
+  const eventName = payload?.meta?.event_name;
+
+  // Only process order_created with status paid
+  if (eventName !== 'order_created') {
+    return res.status(200).json({ received: true, skipped: `Event ${eventName} not handled` });
+  }
+
+  const order = payload.data?.attributes;
+  if (order?.status !== 'paid') {
+    return res.status(200).json({ received: true, skipped: 'Order not paid' });
+  }
+
+  const customData = payload?.meta?.custom_data || {};
+  const tallyUserId = customData.tally_user_id;
+  const tallyCredits = customData.tally_credits;
+
+  if (!tallyUserId) {
+    return res.status(200).json({ received: true, skipped: 'No tally_user_id in custom_data' });
+  }
+
+  const orderId = payload.data?.id;
+  const idempotencyKey = `ls_${orderId}`;
+  const cached = await checkIdempotency(idempotencyKey, appId);
+  if (cached) return res.status(200).json({ received: true, idempotent: true });
+
+  try {
+    let creditsToAdd;
+
+    if (tallyCredits) {
+      creditsToAdd = Number(tallyCredits);
+    } else if (appData?.credit_rate) {
+      // LS total is in cents
+      const amountInMajorUnit = (order.total || 0) / 100;
+      creditsToAdd = Math.floor(amountInMajorUnit * Number(appData.credit_rate));
+    } else {
+      return res.status(200).json({ received: true, skipped: 'No tally_credits and no credit_rate configured' });
+    }
+
+    const appUserId = await getOrCreateUser(appId, tallyUserId);
+
+    const { data: balance } = await supabase
+      .from('balances')
+      .select('balance')
+      .eq('app_user_id', appUserId)
+      .single();
+
+    const balanceAfter = Number(balance.balance) + creditsToAdd;
+
+    await supabase
+      .from('balances')
+      .update({ balance: balanceAfter, updated_at: new Date().toISOString() })
+      .eq('app_user_id', appUserId);
+
+    const { data: ledgerEntry } = await supabase
+      .from('ledger')
+      .insert({
+        app_user_id: appUserId,
+        event_type: 'add',
+        amount: creditsToAdd,
+        balance_after: balanceAfter,
+        idempotency_key: idempotencyKey,
+        reference_id: orderId,
+        description: `Lemon Squeezy order ${orderId}`,
+        metadata: { ls_total: order.total, currency: order.currency },
+      })
+      .select('id')
+      .single();
+
+    const result = { success: true, ledger_id: ledgerEntry.id, credits_added: creditsToAdd };
+    await saveIdempotency(idempotencyKey, appId, result);
+
+    return res.status(200).json({ received: true, ...result });
+  } catch (err) {
+    console.error('Lemon Squeezy webhook error:', err);
+    return res.status(500).json({ error: 'Processing failed' });
+  }
+});
+
 // ============================================
 // BILLING ROUTES
 // ============================================
