@@ -404,24 +404,24 @@ app.get('/credits/history', authenticate, async (req, res) => {
 });
 
 // ============================================
-// POST /webhooks/stripe
+// POST /webhooks/stripe/:app_id
 // Auto top-up credits on successful Stripe payment
-// Expects metadata: { tally_user_id, tally_credits }
+// URL includes app_id so Stripe doesn't need custom headers
+// Expects metadata: { tally_user_id, tally_credits (optional) }
 // ============================================
-app.post('/webhooks/stripe', async (req, res) => {
+app.post('/webhooks/stripe/:appId', async (req, res) => {
   const sig = req.headers['stripe-signature'];
-  const webhookSecret = req.headers['x-tally-webhook-secret'];
+  const { appId } = req.params;
 
-  // Find the app by webhook secret
-  const { data: apiKey } = await supabase
-    .from('api_keys')
-    .select('app_id')
-    .eq('key', webhookSecret)
-    .eq('is_active', true)
+  // Verify the app exists
+  const { data: appData, error: appError } = await supabase
+    .from('apps')
+    .select('id, credit_rate, rate_currency')
+    .eq('id', appId)
     .single();
 
-  if (!apiKey) {
-    return res.status(401).json({ error: 'Invalid webhook secret' });
+  if (appError || !appData) {
+    return res.status(404).json({ error: 'App not found' });
   }
 
   let event;
@@ -442,17 +442,10 @@ app.post('/webhooks/stripe', async (req, res) => {
     const idempotencyKey = `stripe_${intent.id}`;
 
     // Check for duplicate
-    const cached = await checkIdempotency(idempotencyKey, apiKey.app_id);
+    const cached = await checkIdempotency(idempotencyKey, appId);
     if (cached) return res.status(200).json({ received: true, idempotent: true });
 
     try {
-      // Fetch the app to get credit_rate
-      const { data: appData } = await supabase
-        .from('apps')
-        .select('credit_rate')
-        .eq('id', apiKey.app_id)
-        .single();
-
       let creditsToAdd;
 
       if (tally_credits) {
@@ -467,7 +460,7 @@ app.post('/webhooks/stripe', async (req, res) => {
         return res.status(200).json({ received: true, skipped: 'No tally_credits and no credit_rate configured' });
       }
 
-      const appUserId = await getOrCreateUser(apiKey.app_id, tally_user_id);
+      const appUserId = await getOrCreateUser(appId, tally_user_id);
 
       const { data: balance } = await supabase
         .from('balances')
@@ -498,7 +491,7 @@ app.post('/webhooks/stripe', async (req, res) => {
         .single();
 
       const result = { success: true, ledger_id: ledgerEntry.id, credits_added: creditsToAdd };
-      await saveIdempotency(idempotencyKey, apiKey.app_id, result);
+      await saveIdempotency(idempotencyKey, appId, result);
 
     } catch (err) {
       console.error('Stripe webhook processing error:', err);
