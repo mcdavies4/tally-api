@@ -3,12 +3,6 @@
 // server.js — Main Express Server
 // ============================================
 
-console.log('ENV CHECK:', {
-  hasUrl: !!process.env.SUPABASE_URL,
-  hasKey: !!process.env.SUPABASE_SERVICE_KEY,
-  url: process.env.SUPABASE_URL?.slice(0, 30)
-})
-
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
 import Stripe from 'stripe';
