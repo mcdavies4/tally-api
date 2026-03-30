@@ -6,7 +6,6 @@
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
 import Stripe from 'stripe';
-import { randomUUID } from 'crypto';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -22,8 +21,9 @@ const supabase = createClient(
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-// Raw body needed for Stripe webhook signature verification
+// Raw body needed for Stripe + Lemon Squeezy webhook signature verification
 app.use('/webhooks/stripe', express.raw({ type: 'application/json' }));
+app.use('/webhooks/stripe-billing', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
 // ============================================
