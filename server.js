@@ -52,6 +52,83 @@ async function authenticate(req, res, next) {
   next();
 }
 
+
+// ============================================
+// MIDDLEWARE: Plan limit enforcement
+// Checks developer's plan limits before API calls
+// ============================================
+async function enforcePlanLimits(req, res, next) {
+  try {
+    const appId = req.appId;
+
+    // Get app owner email
+    const { data: app } = await supabase
+      .from('apps')
+      .select('owner_email')
+      .eq('id', appId)
+      .single();
+
+    if (!app) return res.status(404).json({ error: 'App not found' });
+
+    // Get owner's subscription
+    const { data: sub } = await supabase
+      .from('subscriptions')
+      .select('plan, status')
+      .eq('owner_email', app.owner_email)
+      .single();
+
+    const plan = sub?.plan || 'free';
+
+    // Get plan limits
+    const { data: limits } = await supabase
+      .from('plan_limits')
+      .select('max_users')
+      .eq('plan', plan)
+      .single();
+
+    const maxUsers = limits?.max_users ?? 100;
+
+    // -1 means unlimited (scale plan)
+    if (maxUsers === -1) return next();
+
+    // Count current active users for this app
+    const { count } = await supabase
+      .from('app_users')
+      .select('id', { count: 'exact' })
+      .eq('app_id', appId);
+
+    const currentUsers = count || 0;
+
+    // Check if this request would create a new user
+    const { user_id } = req.body;
+    if (user_id) {
+      const { data: existingUser } = await supabase
+        .from('app_users')
+        .select('id')
+        .eq('app_id', appId)
+        .eq('external_id', user_id)
+        .single();
+
+      // If user doesn't exist yet and we're at the limit — block
+      if (!existingUser && currentUsers >= maxUsers) {
+        return res.status(402).json({
+          error: 'Plan limit reached',
+          message: `Your ${plan} plan allows up to ${maxUsers} users. Upgrade to add more.`,
+          current_users: currentUsers,
+          max_users: maxUsers,
+          plan,
+          upgrade_url: `${process.env.DASHBOARD_URL}/billing`,
+        });
+      }
+    }
+
+    next();
+  } catch (err) {
+    console.error('Plan enforcement error:', err);
+    next(); // Fail open — don't block on middleware errors
+  }
+}
+
 // ============================================
 // HELPER: Get or create app_user
 // ============================================
@@ -110,7 +187,7 @@ async function saveIdempotency(key, appId, result) {
 // POST /credits/add
 // Add credits to a user's balance
 // ============================================
-app.post('/credits/add', authenticate, async (req, res) => {
+app.post('/credits/add', authenticate, enforcePlanLimits, async (req, res) => {
   const { user_id, amount, description, reference_id, metadata } = req.body;
   const idempotencyKey = req.headers['idempotency-key'];
 
@@ -179,7 +256,7 @@ app.post('/credits/add', authenticate, async (req, res) => {
 // POST /credits/deduct
 // Deduct credits atomically (uses DB function)
 // ============================================
-app.post('/credits/deduct', authenticate, async (req, res) => {
+app.post('/credits/deduct', authenticate, enforcePlanLimits, async (req, res) => {
   const { user_id, amount, description, reference_id, metadata } = req.body;
   const idempotencyKey = req.headers['idempotency-key'];
 
@@ -235,7 +312,7 @@ app.post('/credits/deduct', authenticate, async (req, res) => {
 // POST /credits/refund
 // Reverse a previous transaction by ledger_id
 // ============================================
-app.post('/credits/refund', authenticate, async (req, res) => {
+app.post('/credits/refund', authenticate, enforcePlanLimits, async (req, res) => {
   const { ledger_id, description } = req.body;
   const idempotencyKey = req.headers['idempotency-key'];
 
