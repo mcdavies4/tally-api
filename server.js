@@ -502,6 +502,153 @@ app.post('/webhooks/stripe/:appId', async (req, res) => {
   return res.status(200).json({ received: true });
 });
 
+
+// ============================================
+// BILLING ROUTES
+// ============================================
+
+// POST /billing/create-checkout
+// Creates a Stripe Checkout session for plan upgrade
+app.post('/billing/create-checkout', async (req, res) => {
+  const { email, priceId, plan } = req.body;
+
+  if (!email || !priceId || !plan) {
+    return res.status(400).json({ error: 'email, priceId, and plan are required' });
+  }
+
+  try {
+    // Get or create Stripe customer
+    let { data: sub } = await supabase
+      .from('subscriptions')
+      .select('stripe_customer_id')
+      .eq('owner_email', email)
+      .single();
+
+    let customerId = sub?.stripe_customer_id;
+
+    if (!customerId) {
+      const customer = await stripe.customers.create({ email });
+      customerId = customer.id;
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      customer: customerId,
+      mode: 'subscription',
+      payment_method_types: ['card'],
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: `${process.env.DASHBOARD_URL}/billing?success=true`,
+      cancel_url: `${process.env.DASHBOARD_URL}/billing?cancelled=true`,
+      metadata: { email, plan },
+    });
+
+    return res.status(200).json({ url: session.url });
+  } catch (err) {
+    console.error('Checkout error:', err);
+    return res.status(500).json({ error: 'Failed to create checkout session' });
+  }
+});
+
+// POST /billing/portal
+// Creates a Stripe Customer Portal session for managing subscription
+app.post('/billing/portal', async (req, res) => {
+  const { email } = req.body;
+
+  if (!email) return res.status(400).json({ error: 'email is required' });
+
+  try {
+    const { data: sub } = await supabase
+      .from('subscriptions')
+      .select('stripe_customer_id')
+      .eq('owner_email', email)
+      .single();
+
+    if (!sub?.stripe_customer_id) {
+      return res.status(404).json({ error: 'No billing account found' });
+    }
+
+    const session = await stripe.billingPortal.sessions.create({
+      customer: sub.stripe_customer_id,
+      return_url: `${process.env.DASHBOARD_URL}/billing`,
+    });
+
+    return res.status(200).json({ url: session.url });
+  } catch (err) {
+    console.error('Portal error:', err);
+    return res.status(500).json({ error: 'Failed to create portal session' });
+  }
+});
+
+// POST /webhooks/stripe-billing
+// Handles Tally's own subscription events
+app.post('/webhooks/stripe-billing', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_BILLING_WEBHOOK_SECRET);
+  } catch (err) {
+    return res.status(400).json({ error: 'Webhook signature failed' });
+  }
+
+  const handlers = {
+    'checkout.session.completed': async (data) => {
+      const { email, plan } = data.metadata;
+      const customerId = data.customer;
+      const subscriptionId = data.subscription;
+
+      // Get subscription details for period end
+      const stripeSub = await stripe.subscriptions.retrieve(subscriptionId);
+
+      await supabase.from('subscriptions').upsert({
+        owner_email: email,
+        plan,
+        stripe_customer_id: customerId,
+        stripe_subscription_id: subscriptionId,
+        status: 'active',
+        current_period_end: new Date(stripeSub.current_period_end * 1000).toISOString(),
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'owner_email' });
+    },
+
+    'customer.subscription.updated': async (data) => {
+      const { data: sub } = await supabase
+        .from('subscriptions')
+        .select('owner_email')
+        .eq('stripe_subscription_id', data.id)
+        .single();
+
+      if (!sub) return;
+
+      await supabase.from('subscriptions').update({
+        status: data.status,
+        current_period_end: new Date(data.current_period_end * 1000).toISOString(),
+        updated_at: new Date().toISOString(),
+      }).eq('stripe_subscription_id', data.id);
+    },
+
+    'customer.subscription.deleted': async (data) => {
+      await supabase.from('subscriptions').update({
+        plan: 'free',
+        status: 'cancelled',
+        stripe_subscription_id: null,
+        updated_at: new Date().toISOString(),
+      }).eq('stripe_subscription_id', data.id);
+    },
+  };
+
+  const handler = handlers[event.type];
+  if (handler) {
+    try {
+      await handler(event.data.object);
+    } catch (err) {
+      console.error(`Billing webhook handler error for ${event.type}:`, err);
+      return res.status(500).json({ error: 'Handler failed' });
+    }
+  }
+
+  return res.status(200).json({ received: true });
+});
+
 // ============================================
 // Health check
 // ============================================
