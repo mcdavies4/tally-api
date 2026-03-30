@@ -435,8 +435,8 @@ app.post('/webhooks/stripe', async (req, res) => {
     const intent = event.data.object;
     const { tally_user_id, tally_credits } = intent.metadata;
 
-    if (!tally_user_id || !tally_credits) {
-      return res.status(200).json({ received: true, skipped: 'No tally metadata' });
+    if (!tally_user_id) {
+      return res.status(200).json({ received: true, skipped: 'No tally_user_id in metadata' });
     }
 
     const idempotencyKey = `stripe_${intent.id}`;
@@ -446,6 +446,27 @@ app.post('/webhooks/stripe', async (req, res) => {
     if (cached) return res.status(200).json({ received: true, idempotent: true });
 
     try {
+      // Fetch the app to get credit_rate
+      const { data: appData } = await supabase
+        .from('apps')
+        .select('credit_rate')
+        .eq('id', apiKey.app_id)
+        .single();
+
+      let creditsToAdd;
+
+      if (tally_credits) {
+        // Developer explicitly passed credits — use that directly
+        creditsToAdd = Number(tally_credits);
+      } else if (appData?.credit_rate) {
+        // Use the app's credit rate
+        // Stripe amounts are in pence/cents — divide by 100 to get major unit
+        const amountInMajorUnit = intent.amount / 100;
+        creditsToAdd = Math.floor(amountInMajorUnit * Number(appData.credit_rate));
+      } else {
+        return res.status(200).json({ received: true, skipped: 'No tally_credits and no credit_rate configured' });
+      }
+
       const appUserId = await getOrCreateUser(apiKey.app_id, tally_user_id);
 
       const { data: balance } = await supabase
@@ -454,7 +475,6 @@ app.post('/webhooks/stripe', async (req, res) => {
         .eq('app_user_id', appUserId)
         .single();
 
-      const creditsToAdd = Number(tally_credits);
       const balanceAfter = Number(balance.balance) + creditsToAdd;
 
       await supabase
