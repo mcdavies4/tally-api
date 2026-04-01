@@ -48,7 +48,7 @@ async function authenticate(req, res, next) {
 
   const { data, error } = await supabase
     .from('api_keys')
-    .select('id, app_id, is_active')
+    .select('id, app_id, is_active, is_sandbox')
     .eq('key', key)
     .single();
 
@@ -58,6 +58,7 @@ async function authenticate(req, res, next) {
 
   req.appId = data.app_id;
   req.apiKeyId = data.id;
+  req.isSandbox = data.is_sandbox || key.startsWith('tally_test_');
   next();
 }
 
@@ -141,13 +142,14 @@ async function enforcePlanLimits(req, res, next) {
 // ============================================
 // HELPER: Get or create app_user
 // ============================================
-async function getOrCreateUser(appId, externalId) {
+async function getOrCreateUser(appId, externalId, isSandbox = false) {
   // Try to find existing user
   const { data: existing } = await supabase
     .from('app_users')
     .select('id')
     .eq('app_id', appId)
     .eq('external_id', externalId)
+    .eq('is_sandbox', isSandbox)
     .single();
 
   if (existing) return existing.id;
@@ -155,7 +157,7 @@ async function getOrCreateUser(appId, externalId) {
   // Create user
   const { data: newUser, error } = await supabase
     .from('app_users')
-    .insert({ app_id: appId, external_id: externalId })
+    .insert({ app_id: appId, external_id: externalId, is_sandbox: isSandbox })
     .select('id')
     .single();
 
@@ -164,7 +166,7 @@ async function getOrCreateUser(appId, externalId) {
   // Initialise balance row
   await supabase
     .from('balances')
-    .insert({ app_user_id: newUser.id, balance: 0 });
+    .insert({ app_user_id: newUser.id, balance: 0, is_sandbox: isSandbox });
 
   return newUser.id;
 }
@@ -209,13 +211,14 @@ app.post('/credits/add', authenticate, enforcePlanLimits, async (req, res) => {
   if (cached) return res.status(200).json({ ...cached, idempotent: true });
 
   try {
-    const appUserId = await getOrCreateUser(req.appId, user_id);
+    const appUserId = await getOrCreateUser(req.appId, user_id, req.isSandbox);
 
     // Atomic balance update + ledger write
     const { data: balance, error: balanceError } = await supabase
       .from('balances')
       .select('balance')
       .eq('app_user_id', appUserId)
+      .eq('is_sandbox', req.isSandbox)
       .single();
 
     if (balanceError) throw balanceError;
@@ -240,6 +243,7 @@ app.post('/credits/add', authenticate, enforcePlanLimits, async (req, res) => {
         reference_id: reference_id || null,
         description: description || 'Credit top-up',
         metadata: metadata || null,
+        is_sandbox: req.isSandbox,
       })
       .select('id')
       .single();
@@ -288,6 +292,7 @@ app.post('/credits/deduct', authenticate, enforcePlanLimits, async (req, res) =>
       p_reference_id: reference_id || null,
       p_description: description || 'Credit deduction',
       p_metadata: metadata || null,
+      p_is_sandbox: req.isSandbox,
     });
 
     if (error) throw error;
@@ -421,22 +426,25 @@ app.get('/credits/balance', authenticate, async (req, res) => {
       .select('id')
       .eq('app_id', req.appId)
       .eq('external_id', user_id)
+      .eq('is_sandbox', req.isSandbox)
       .single();
 
     if (!user) {
-      return res.status(200).json({ user_id, balance: 0 });
+      return res.status(200).json({ user_id, balance: 0, sandbox: req.isSandbox });
     }
 
     const { data: balance } = await supabase
       .from('balances')
       .select('balance, updated_at')
       .eq('app_user_id', user.id)
+      .eq('is_sandbox', req.isSandbox)
       .single();
 
     return res.status(200).json({
       user_id,
       balance: Number(balance?.balance || 0),
       updated_at: balance?.updated_at,
+      sandbox: req.isSandbox,
     });
 
   } catch (err) {
@@ -462,16 +470,18 @@ app.get('/credits/history', authenticate, async (req, res) => {
       .select('id')
       .eq('app_id', req.appId)
       .eq('external_id', user_id)
+      .eq('is_sandbox', req.isSandbox)
       .single();
 
     if (!user) {
-      return res.status(200).json({ user_id, entries: [], total: 0 });
+      return res.status(200).json({ user_id, entries: [], total: 0, sandbox: req.isSandbox });
     }
 
     const { data: entries, count } = await supabase
       .from('ledger')
       .select('id, event_type, amount, balance_after, reference_id, description, metadata, created_at', { count: 'exact' })
       .eq('app_user_id', user.id)
+      .eq('is_sandbox', req.isSandbox)
       .order('created_at', { ascending: false })
       .range(Number(offset), Number(offset) + Number(limit) - 1);
 
