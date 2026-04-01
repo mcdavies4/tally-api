@@ -21,7 +21,16 @@ const supabase = createClient(
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-// Raw body needed for Stripe + Lemon Squeezy webhook signature verification
+// CORS — allow dashboard and any developer frontend to call the API
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Idempotency-Key');
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  next();
+});
+
+// Raw body needed for Stripe webhook signature verification
 app.use('/webhooks/stripe', express.raw({ type: 'application/json' }));
 app.use('/webhooks/stripe-billing', express.raw({ type: 'application/json' }));
 app.use(express.json());
