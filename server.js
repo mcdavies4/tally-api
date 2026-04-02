@@ -63,6 +63,73 @@ async function authenticate(req, res, next) {
 }
 
 
+
+// ============================================
+// HELPER: Fire low balance webhook
+// Called after every deduction
+// ============================================
+async function checkAndFireLowBalanceAlert(appId, appUserId, externalUserId, balanceAfter, isSandbox) {
+  try {
+    // Skip alerts for sandbox mode
+    if (isSandbox) return;
+
+    // Get app alert config
+    const { data: app } = await supabase
+      .from('apps')
+      .select('alert_enabled, alert_threshold, alert_webhook_url, name')
+      .eq('id', appId)
+      .single();
+
+    if (!app?.alert_enabled || !app?.alert_webhook_url || !app?.alert_threshold) return;
+    if (balanceAfter > Number(app.alert_threshold)) return;
+
+    // Check last alert — don't spam (max 1 alert per hour per user)
+    const { data: user } = await supabase
+      .from('app_users')
+      .select('last_alert_sent_at')
+      .eq('id', appUserId)
+      .single();
+
+    if (user?.last_alert_sent_at) {
+      const lastAlert = new Date(user.last_alert_sent_at);
+      const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
+      if (lastAlert > hourAgo) return; // Already alerted within the last hour
+    }
+
+    // Update last alert time
+    await supabase
+      .from('app_users')
+      .update({ last_alert_sent_at: new Date().toISOString() })
+      .eq('id', appUserId);
+
+    // Fire the webhook
+    const payload = {
+      event: 'credits.low_balance',
+      app_id: appId,
+      app_name: app.name,
+      user_id: externalUserId,
+      balance: balanceAfter,
+      threshold: Number(app.alert_threshold),
+      timestamp: new Date().toISOString(),
+    };
+
+    await fetch(app.alert_webhook_url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Tally-Event': 'credits.low_balance',
+        'X-Tally-App-Id': appId,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    console.log(`Low balance alert fired for user ${externalUserId} in app ${appId}`);
+  } catch (err) {
+    // Never throw — alerts are best-effort
+    console.error('Low balance alert error:', err.message);
+  }
+}
+
 // ============================================
 // MIDDLEWARE: Plan limit enforcement
 // Checks developer's plan limits before API calls
@@ -311,9 +378,14 @@ app.post('/credits/deduct', authenticate, enforcePlanLimits, async (req, res) =>
       amount: Number(amount),
       balance_before: data.balance_before,
       balance_after: data.balance_after,
+      sandbox: req.isSandbox,
     };
 
     await saveIdempotency(idempotencyKey, req.appId, result);
+
+    // Fire low balance alert if needed (async, non-blocking)
+    checkAndFireLowBalanceAlert(req.appId, appUserId, user_id, data.balance_after, req.isSandbox);
+
     return res.status(200).json(result);
 
   } catch (err) {
