@@ -266,7 +266,7 @@ async function saveIdempotency(key, appId, result) {
 // Add credits to a user's balance
 // ============================================
 app.post('/credits/add', authenticate, enforcePlanLimits, async (req, res) => {
-  const { user_id, amount, description, reference_id, metadata } = req.body;
+  const { user_id, amount, description, reference_id, metadata, expires_in_days } = req.body;
   const idempotencyKey = req.headers['idempotency-key'];
 
   if (!user_id || !amount || amount <= 0) {
@@ -321,6 +321,8 @@ app.post('/credits/add', authenticate, enforcePlanLimits, async (req, res) => {
       user_id,
       amount: Number(amount),
       balance_after: balanceAfter,
+      expires_at: expiresAt,
+      sandbox: req.isSandbox,
     };
 
     await saveIdempotency(idempotencyKey, req.appId, result);
@@ -512,10 +514,20 @@ app.get('/credits/balance', authenticate, async (req, res) => {
       .eq('is_sandbox', req.isSandbox)
       .single();
 
+    // Process any expired credits before returning balance
+    await supabase.rpc('process_expired_credits', { p_app_user_id: user.id });
+
+    // Re-fetch balance after expiry processing
+    const { data: freshBalance } = await supabase
+      .from('balances')
+      .select('balance, updated_at')
+      .eq('app_user_id', user.id)
+      .single();
+
     return res.status(200).json({
       user_id,
-      balance: Number(balance?.balance || 0),
-      updated_at: balance?.updated_at,
+      balance: Number(freshBalance?.balance || 0),
+      updated_at: freshBalance?.updated_at,
       sandbox: req.isSandbox,
     });
 
@@ -551,7 +563,7 @@ app.get('/credits/history', authenticate, async (req, res) => {
 
     const { data: entries, count } = await supabase
       .from('ledger')
-      .select('id, event_type, amount, balance_after, reference_id, description, metadata, created_at', { count: 'exact' })
+      .select('id, event_type, amount, balance_after, reference_id, description, metadata, created_at, expires_at', { count: 'exact' })
       .eq('app_user_id', user.id)
       .eq('is_sandbox', req.isSandbox)
       .order('created_at', { ascending: false })
