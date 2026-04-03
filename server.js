@@ -1067,3 +1067,268 @@ app.get('/health', (req, res) => {
 app.listen(PORT, () => {
   console.log(`Tally API running on port ${PORT}`);
 });
+
+// ============================================
+// HOSTED TOP-UP PAGE
+// GET /topup/:appId?user_id=xxx
+// Shows a branded page for end users to buy credits
+// ============================================
+app.get('/topup/:appId', async (req, res) => {
+  const { appId } = req.params;
+  const { user_id } = req.query;
+
+  if (!user_id) {
+    return res.status(400).send('<h2>Missing user_id parameter</h2>');
+  }
+
+  // Get app details
+  const { data: app, error: appError } = await supabase
+    .from('apps')
+    .select('id, name, brand_name, brand_color, topup_success_url, topup_cancel_url')
+    .eq('id', appId)
+    .single();
+
+  if (appError || !app) {
+    return res.status(404).send('<h2>App not found</h2>');
+  }
+
+  // Get active credit packages
+  const { data: packages } = await supabase
+    .from('credit_packages')
+    .select('*')
+    .eq('app_id', appId)
+    .eq('is_active', true)
+    .order('sort_order', { ascending: true });
+
+  if (!packages || packages.length === 0) {
+    return res.status(404).send('<h2>No credit packages configured for this app</h2>');
+  }
+
+  const brandName = app.brand_name || app.name;
+  const brandColor = app.brand_color || '#00ff88';
+  const currencySymbol = { gbp: '£', usd: '$', eur: '€', ngn: '₦' };
+
+  const packagesHTML = packages.map(pkg => {
+    const symbol = currencySymbol[pkg.currency] || pkg.currency.toUpperCase();
+    const price = (pkg.price_amount / 100).toFixed(2);
+    return `
+      <div class="package ${pkg.is_popular ? 'popular' : ''}" onclick="buy('${pkg.id}')">
+        ${pkg.is_popular ? '<div class="popular-badge">Most Popular</div>' : ''}
+        <div class="pkg-name">${pkg.name}</div>
+        <div class="pkg-credits">${pkg.credits.toLocaleString()} <span>credits</span></div>
+        ${pkg.description ? `<div class="pkg-desc">${pkg.description}</div>` : ''}
+        <div class="pkg-price">${symbol}${price}</div>
+        <button class="pkg-btn" style="background: ${brandColor}; color: #000;">
+          Buy now
+        </button>
+      </div>
+    `;
+  }).join('');
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Buy Credits — ${brandName}</title>
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root { --accent: ${brandColor}; }
+    html, body { min-height: 100vh; background: #0a0a0a; color: #f0f0f0; font-family: 'Syne', sans-serif; -webkit-font-smoothing: antialiased; }
+    .container { max-width: 700px; margin: 0 auto; padding: 60px 24px; }
+    .header { text-align: center; margin-bottom: 48px; }
+    .brand { font-size: 14px; color: #555; font-family: 'DM Mono', monospace; margin-bottom: 12px; }
+    h1 { font-size: 36px; font-weight: 800; letter-spacing: -1px; margin-bottom: 10px; }
+    h1 span { color: var(--accent); }
+    .subtitle { font-size: 14px; color: #666; font-family: 'DM Mono', monospace; }
+    .packages { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; }
+    .package { background: #111; border: 1px solid #1a1a1a; border-radius: 12px; padding: 24px; text-align: center; cursor: pointer; position: relative; transition: border-color 0.2s, transform 0.2s; }
+    .package:hover { border-color: var(--accent); transform: translateY(-2px); }
+    .package.popular { border-color: var(--accent); }
+    .popular-badge { position: absolute; top: -10px; left: 50%; transform: translateX(-50%); background: var(--accent); color: #000; font-size: 10px; font-weight: 700; padding: 3px 12px; border-radius: 20px; white-space: nowrap; font-family: 'DM Mono', monospace; }
+    .pkg-name { font-size: 14px; font-weight: 700; margin-bottom: 12px; }
+    .pkg-credits { font-size: 32px; font-weight: 800; letter-spacing: -1px; color: var(--accent); margin-bottom: 4px; }
+    .pkg-credits span { font-size: 14px; color: #555; font-weight: 400; }
+    .pkg-desc { font-size: 11px; color: #555; font-family: 'DM Mono', monospace; margin-bottom: 12px; line-height: 1.5; }
+    .pkg-price { font-size: 20px; font-weight: 800; margin-bottom: 16px; }
+    .pkg-btn { width: 100%; padding: 11px; border: none; border-radius: 6px; font-size: 13px; font-weight: 700; cursor: pointer; font-family: 'Syne', sans-serif; transition: opacity 0.15s; }
+    .pkg-btn:hover { opacity: 0.85; }
+    .footer { text-align: center; margin-top: 40px; font-size: 11px; color: #333; font-family: 'DM Mono', monospace; }
+    .footer a { color: #444; text-decoration: none; }
+    .loading { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); align-items: center; justify-content: center; z-index: 100; }
+    .loading.show { display: flex; }
+    .spinner { width: 32px; height: 32px; border: 3px solid #222; border-top-color: var(--accent); border-radius: 50%; animation: spin 0.6s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="loading" id="loading"><div class="spinner"></div></div>
+  <div class="container">
+    <div class="header">
+      <div class="brand">${brandName}</div>
+      <h1>Buy <span>credits</span></h1>
+      <div class="subtitle">Choose a package to top up your balance instantly</div>
+    </div>
+    <div class="packages">${packagesHTML}</div>
+    <div class="footer">
+      Payments powered by Stripe &nbsp;·&nbsp;
+      <a href="https://tally-landing-ochre.vercel.app" target="_blank">Powered by Tally</a>
+    </div>
+  </div>
+  <script>
+    async function buy(packageId) {
+      document.getElementById('loading').classList.add('show');
+      try {
+        const res = await fetch('/topup/${appId}/checkout', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ package_id: packageId, user_id: '${user_id}' })
+        });
+        const { url, error } = await res.json();
+        if (error) { alert(error); document.getElementById('loading').classList.remove('show'); return; }
+        window.location.href = url;
+      } catch (err) {
+        alert('Something went wrong. Please try again.');
+        document.getElementById('loading').classList.remove('show');
+      }
+    }
+  </script>
+</body>
+</html>`;
+
+  res.setHeader('Content-Type', 'text/html');
+  return res.send(html);
+});
+
+// ============================================
+// POST /topup/:appId/checkout
+// Creates Stripe checkout for a credit package
+// ============================================
+app.post('/topup/:appId/checkout', async (req, res) => {
+  const { appId } = req.params;
+  const { package_id, user_id } = req.body;
+
+  if (!package_id || !user_id) {
+    return res.status(400).json({ error: 'package_id and user_id are required' });
+  }
+
+  // Get package
+  const { data: pkg, error: pkgError } = await supabase
+    .from('credit_packages')
+    .select('*, apps(name, brand_name, topup_success_url, topup_cancel_url)')
+    .eq('id', package_id)
+    .eq('app_id', appId)
+    .eq('is_active', true)
+    .single();
+
+  if (pkgError || !pkg) {
+    return res.status(404).json({ error: 'Package not found' });
+  }
+
+  const app = pkg.apps;
+  const successUrl = app.topup_success_url || `${process.env.DASHBOARD_URL}?topup=success`;
+  const cancelUrl = app.topup_cancel_url || `${process.env.API_URL}/topup/${appId}?user_id=${user_id}`;
+
+  try {
+    // Use existing Stripe price if set, otherwise create dynamic session
+    const sessionParams = {
+      mode: 'payment',
+      payment_method_types: ['card'],
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      metadata: {
+        tally_user_id: user_id,
+        tally_credits: String(pkg.credits),
+        tally_app_id: appId,
+      },
+    };
+
+    if (pkg.stripe_price_id) {
+      sessionParams.line_items = [{ price: pkg.stripe_price_id, quantity: 1 }];
+    } else {
+      sessionParams.line_items = [{
+        price_data: {
+          currency: pkg.currency,
+          product_data: {
+            name: `${pkg.credits.toLocaleString()} Credits — ${app.brand_name || app.name}`,
+            description: pkg.description || `${pkg.credits.toLocaleString()} credits for ${app.brand_name || app.name}`,
+          },
+          unit_amount: pkg.price_amount,
+        },
+        quantity: 1,
+      }];
+    }
+
+    const session = await stripe.checkout.sessions.create(sessionParams);
+    return res.status(200).json({ url: session.url });
+  } catch (err) {
+    console.error('Top-up checkout error:', err);
+    return res.status(500).json({ error: 'Failed to create checkout' });
+  }
+});
+
+// ============================================
+// PACKAGES API — for dashboard management
+// ============================================
+
+// GET /apps/:appId/packages
+app.get('/apps/:appId/packages', authenticate, async (req, res) => {
+  if (req.appId !== req.params.appId) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  const { data } = await supabase
+    .from('credit_packages')
+    .select('*')
+    .eq('app_id', req.params.appId)
+    .order('sort_order', { ascending: true });
+  return res.status(200).json({ packages: data || [] });
+});
+
+// POST /apps/:appId/packages
+app.post('/apps/:appId/packages', authenticate, async (req, res) => {
+  if (req.appId !== req.params.appId) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  const { name, description, credits, price_amount, currency, is_popular, sort_order } = req.body;
+  if (!name || !credits || !price_amount) {
+    return res.status(400).json({ error: 'name, credits, and price_amount are required' });
+  }
+  const { data, error } = await supabase
+    .from('credit_packages')
+    .insert({ app_id: req.params.appId, name, description, credits, price_amount, currency: currency || 'gbp', is_popular: is_popular || false, sort_order: sort_order || 0 })
+    .select()
+    .single();
+  if (error) return res.status(500).json({ error: 'Failed to create package' });
+  return res.status(200).json({ package: data });
+});
+
+// PUT /apps/:appId/packages/:packageId
+app.put('/apps/:appId/packages/:packageId', authenticate, async (req, res) => {
+  if (req.appId !== req.params.appId) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  const { name, description, credits, price_amount, currency, is_popular, is_active, sort_order } = req.body;
+  const { data, error } = await supabase
+    .from('credit_packages')
+    .update({ name, description, credits, price_amount, currency, is_popular, is_active, sort_order })
+    .eq('id', req.params.packageId)
+    .eq('app_id', req.params.appId)
+    .select()
+    .single();
+  if (error) return res.status(500).json({ error: 'Failed to update package' });
+  return res.status(200).json({ package: data });
+});
+
+// DELETE /apps/:appId/packages/:packageId
+app.delete('/apps/:appId/packages/:packageId', authenticate, async (req, res) => {
+  if (req.appId !== req.params.appId) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  await supabase
+    .from('credit_packages')
+    .update({ is_active: false })
+    .eq('id', req.params.packageId)
+    .eq('app_id', req.params.appId);
+  return res.status(200).json({ success: true });
+});
