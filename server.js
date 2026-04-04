@@ -911,6 +911,134 @@ app.post('/webhooks/lemonsqueezy/:appId', express.raw({ type: 'application/json'
   }
 });
 
+
+// ============================================
+// POST /webhooks/paddle/:appId
+// Auto top-up credits on Paddle transaction.completed
+// Expects custom_data: { tally_user_id, tally_credits (optional) }
+// ============================================
+app.post('/webhooks/paddle/:appId', express.raw({ type: 'application/json' }), async (req, res) => {
+  const { appId } = req.params;
+  const signatureHeader = req.headers['paddle-signature'];
+
+  // Get app + its paddle secret
+  const { data: appData, error: appError } = await supabase
+    .from('apps')
+    .select('id, credit_rate, name, paddle_webhook_secret')
+    .eq('id', appId)
+    .single();
+
+  if (appError || !appData) {
+    return res.status(404).json({ error: 'App not found' });
+  }
+
+  // Verify Paddle signature using the app's own secret
+  const paddleSecret = appData.paddle_webhook_secret;
+  if (paddleSecret && signatureHeader) {
+    try {
+      const { createHmac, timingSafeEqual } = await import('crypto');
+      const parts = signatureHeader.split(';');
+      const tsPart = parts.find(p => p.startsWith('ts='));
+      const h1Part = parts.find(p => p.startsWith('h1='));
+
+      if (!tsPart || !h1Part) {
+        return res.status(401).json({ error: 'Invalid signature format' });
+      }
+
+      const ts = tsPart.split('=')[1];
+      const h1 = h1Part.split('=')[1];
+      const signedPayload = `${ts}:${req.body.toString()}`;
+      const expected = createHmac('sha256', paddleSecret).update(signedPayload).digest('hex');
+
+      if (!timingSafeEqual(Buffer.from(h1), Buffer.from(expected))) {
+        return res.status(401).json({ error: 'Invalid signature' });
+      }
+    } catch (err) {
+      console.error('Paddle signature error:', err);
+      return res.status(401).json({ error: 'Signature verification failed' });
+    }
+  }
+
+  const payload = JSON.parse(req.body.toString());
+  const eventType = payload?.event_type;
+
+  if (eventType !== 'transaction.completed') {
+    return res.status(200).json({ received: true, skipped: `Event ${eventType} not handled` });
+  }
+
+  const transaction = payload.data;
+  const customData = transaction?.custom_data || {};
+  const tallyUserId = customData.tally_user_id;
+  const tallyCredits = customData.tally_credits;
+
+  if (!tallyUserId) {
+    return res.status(200).json({ received: true, skipped: 'No tally_user_id in custom_data' });
+  }
+
+  // Idempotency — same transaction never credited twice
+  const idempotencyKey = `paddle_${transaction?.id}`;
+  const cached = await checkIdempotency(idempotencyKey, appId);
+  if (cached) return res.status(200).json({ received: true, idempotent: true });
+
+  try {
+    let creditsToAdd;
+    if (tallyCredits) {
+      creditsToAdd = Number(tallyCredits);
+    } else if (appData?.credit_rate) {
+      const grandTotal = Number(transaction?.details?.totals?.grand_total || 0);
+      creditsToAdd = Math.floor((grandTotal / 100) * Number(appData.credit_rate));
+    } else {
+      return res.status(200).json({ received: true, skipped: 'No tally_credits and no credit_rate configured' });
+    }
+
+    const appUserId = await getOrCreateUser(appId, tallyUserId, false);
+
+    const { data: balance } = await supabase
+      .from('balances')
+      .select('balance')
+      .eq('app_user_id', appUserId)
+      .eq('is_sandbox', false)
+      .single();
+
+    const balanceAfter = Number(balance.balance) + creditsToAdd;
+
+    await supabase
+      .from('balances')
+      .update({ balance: balanceAfter, updated_at: new Date().toISOString() })
+      .eq('app_user_id', appUserId)
+      .eq('is_sandbox', false);
+
+    const { data: ledgerEntry } = await supabase
+      .from('ledger')
+      .insert({
+        app_user_id: appUserId,
+        event_type: 'add',
+        amount: creditsToAdd,
+        balance_after: balanceAfter,
+        idempotency_key: idempotencyKey,
+        reference_id: transaction?.id,
+        description: `Paddle payment`,
+        metadata: {
+          paddle_transaction_id: transaction?.id,
+          grand_total: transaction?.details?.totals?.grand_total,
+          currency: transaction?.currency_code,
+        },
+        is_sandbox: false,
+      })
+      .select('id')
+      .single();
+
+    const result = { success: true, ledger_id: ledgerEntry.id, credits_added: creditsToAdd };
+    await saveIdempotency(idempotencyKey, appId, result);
+    checkAndFireLowBalanceAlert(appId, appUserId, tallyUserId, balanceAfter, false);
+
+    return res.status(200).json({ received: true, ...result });
+  } catch (err) {
+    console.error('Paddle webhook error:', err);
+    return res.status(500).json({ error: 'Processing failed' });
+  }
+});
+
 // ============================================
 // BILLING ROUTES
 // ============================================
