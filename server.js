@@ -305,7 +305,7 @@ app.post('/credits/add', authenticate, enforcePlanLimits, async (req, res) => {
       .eq('app_user_id', appUserId);
 
     // Write ledger entry
-    const { data: ledgerEntry } = await supabase
+    const { data: ledgerEntry, error: ledgerError } = await supabase
       .from('ledger')
       .insert({
         app_user_id: appUserId,
@@ -321,6 +321,11 @@ app.post('/credits/add', authenticate, enforcePlanLimits, async (req, res) => {
       })
       .select('id')
       .single();
+
+    if (ledgerError) {
+      console.error('Ledger insert error:', JSON.stringify(ledgerError));
+      throw ledgerError;
+    }
 
     const result = {
       success: true,
