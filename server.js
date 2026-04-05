@@ -280,6 +280,12 @@ app.post('/credits/add', authenticate, enforcePlanLimits, async (req, res) => {
   try {
     const appUserId = await getOrCreateUser(req.appId, user_id, req.isSandbox);
 
+    // Compute expiry if expires_in_days provided
+    let expiresAt = null;
+    if (expires_in_days && Number(expires_in_days) > 0) {
+      expiresAt = new Date(Date.now() + Number(expires_in_days) * 24 * 60 * 60 * 1000).toISOString();
+    }
+
     // Atomic balance update + ledger write
     const { data: balance, error: balanceError } = await supabase
       .from('balances')
@@ -311,6 +317,7 @@ app.post('/credits/add', authenticate, enforcePlanLimits, async (req, res) => {
         description: description || 'Credit top-up',
         metadata: metadata || null,
         is_sandbox: req.isSandbox,
+        expires_at: expiresAt,
       })
       .select('id')
       .single();
